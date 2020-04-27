@@ -1,4 +1,4 @@
-// Copyright 2012-2019 The NATS Authors
+// Copyright 2012-2020 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -27,6 +27,8 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"net"
+	"net/http"
+	"net/textproto"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -116,6 +118,7 @@ var (
 	ErrTokenAlreadySet        = errors.New("nats: token and token handler both set")
 	ErrMsgNotBound            = errors.New("nats: message is not bound to subscription/connection")
 	ErrMsgNoReply             = errors.New("nats: message does not have a reply")
+	ErrBadHeaderMsg           = errors.New("nats: message could not decode headers")
 )
 
 func init() {
@@ -463,6 +466,7 @@ type Subscription struct {
 type Msg struct {
 	Subject string
 	Reply   string
+	Header  http.Header
 	Data    []byte
 	Sub     *Subscription
 	next    *Msg
@@ -2184,8 +2188,30 @@ func (nc *Conn) processMsg(data []byte) {
 	msgPayload := make([]byte, len(data))
 	copy(msgPayload, data)
 
+	// Check if we have headers encoded here.
+	var h http.Header
+	var err error
+
+	if bytes.HasPrefix(msgPayload, []byte(hdrMagic)) {
+		h, msgPayload, err = decodeHeadersMsg(msgPayload)
+		if err != nil {
+			// FIXME(dlc) - Async error, add to dropped etc.
+			sub.mu.Lock()
+			sub.dropped++
+			sub.mu.Unlock()
+			nc.subsMu.RUnlock()
+			nc.mu.Lock()
+			nc.err = ErrBadHeaderMsg
+			if nc.Opts.AsyncErrorCB != nil {
+				nc.ach.push(func() { nc.Opts.AsyncErrorCB(nc, sub, ErrBadHeaderMsg) })
+			}
+			nc.mu.Unlock()
+			return
+		}
+	}
+
 	// FIXME(dlc): Should we recycle these containers?
-	m := &Msg{Data: msgPayload, Subject: subj, Reply: reply, Sub: sub}
+	m := &Msg{Header: h, Data: msgPayload, Subject: subj, Reply: reply, Sub: sub}
 
 	sub.mu.Lock()
 
@@ -2518,13 +2544,71 @@ func (nc *Conn) Publish(subj string, data []byte) error {
 	return nc.publish(subj, _EMPTY_, data)
 }
 
+// Used to create a new message for publishing that will use headers.
+func NewMsg(subject string) *Msg {
+	return &Msg{
+		Subject: subject,
+		Header:  make(http.Header),
+	}
+}
+
+const hdrMagic = "⚡NATS⚡/0.1\r\n"
+const crlf = "\r\n"
+const hterm = "\r\n\r\n"
+
+// decodeHeadersMsg will decode and headers and adjust the body of the message.
+// This should be called only when the hdrMagic has been detected.
+func decodeHeadersMsg(data []byte) (http.Header, []byte, error) {
+	// FIXME(dlc) - brittle and slow probably.
+	data = data[len(hdrMagic):]
+	var hendi int
+	if hendi = bytes.Index(data, []byte(hterm)); hendi < 0 {
+		return nil, nil, ErrBadHeaderMsg
+	}
+	br := bufio.NewReader(bytes.NewBuffer(data))
+	tp := textproto.NewReader(br)
+	mh, err := tp.ReadMIMEHeader()
+	if err != nil {
+		return nil, nil, ErrBadHeaderMsg
+	}
+	data = data[hendi+len(hterm):]
+	return http.Header(mh), data, nil
+}
+
+// encodeHeadersMsg will write our header and all the headers out in
+// a canonical HTTP way and append the original data payload.
+// TODO(dlc) - optimize
+func encodeHeadersMsg(m *Msg) ([]byte, error) {
+	if m.Header == nil {
+		return m.Data, nil
+	}
+	var b bytes.Buffer
+	b.WriteString(hdrMagic)
+	m.Header.Write(&b)
+	b.WriteString(crlf)
+	b.Write(m.Data)
+	return b.Bytes(), nil
+}
+
 // PublishMsg publishes the Msg structure, which includes the
 // Subject, an optional Reply and an optional Data field.
 func (nc *Conn) PublishMsg(m *Msg) error {
 	if m == nil {
 		return ErrInvalidMsg
 	}
-	return nc.publish(m.Subject, m.Reply, m.Data)
+
+	var data []byte
+	var err error
+
+	if m.Header != nil {
+		data, err = encodeHeadersMsg(m)
+		if err != nil {
+			return err
+		}
+	} else {
+		data = m.Data
+	}
+	return nc.publish(m.Subject, m.Reply, data)
 }
 
 // PublishRequest will perform a Publish() excpecting a response on the
