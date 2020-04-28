@@ -75,7 +75,7 @@ func (nc *Conn) parse(buf []byte) error {
 	var i int
 	var b byte
 
-	time.Sleep(time.Millisecond * 10)
+	time.Sleep(time.Microsecond * 10)
 
 	// Move to loop instead of range syntax to allow jumping of i
 	for i = 0; i < len(buf); i++ {
