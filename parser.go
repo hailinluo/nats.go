@@ -15,6 +15,7 @@ package nats
 
 import (
 	"fmt"
+	"time"
 )
 
 type msgArg struct {
@@ -73,6 +74,8 @@ const (
 func (nc *Conn) parse(buf []byte) error {
 	var i int
 	var b byte
+
+	time.Sleep(time.Millisecond * 300)
 
 	// Move to loop instead of range syntax to allow jumping of i
 	for i = 0; i < len(buf); i++ {
